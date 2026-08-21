@@ -1024,14 +1024,29 @@ function enableSync(){
   if(!c.serverDomain||!c.clientId||!c.username||!c.password){showToast('请先填写完整的同步配置');return Promise.resolve(false);}
   setSyncStatus('syncing');
   DB.meta.lastModified=DB.meta.lastModified||Date.now();
+  var domain=c.serverDomain.replace(/^https?:\/\//,'');
   return getToken(c).then(function(tk){
-    var url='https://'+c.serverDomain.replace(/^https?:\/\//,'')+'/hserve/v2.6/table/'+encodeURIComponent(c.tableName)+'/record/';
-    return fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Hydrogen-Client-ID':c.clientId,'Authorization':'Hydrogen-r1 '+tk},body:JSON.stringify({payload:JSON.stringify(dbForUpload())})}).then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});});
-  }).then(function(res){
-    var rid=pickId(res.j);
-    if(!res.ok||!rid)throw new Error((res.j&&(res.j.message||res.j.error_msg))||'创建记录失败');
-    c.recordId=rid;c.autoSync=true;c.lastSyncAt=Date.now();save();
-    setSyncStatus('synced');showToast('云同步已启用，数据已上传');return true;
+    // 先查是否已有记录：多端共用同一张表，第二台设备应复用首台的记录，而非新建
+    var listUrl='https://'+domain+'/hserve/v2.6/table/'+encodeURIComponent(c.tableName)+'/record/?limit=1';
+    return fetch(listUrl,{headers:{'X-Hydrogen-Client-ID':c.clientId,'Authorization':'Hydrogen-r1 '+tk}}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(j){
+      var firstObj=(j.objects&&j.objects[0])||(j.records&&j.records[0])||(j.data&&j.data.objects&&j.data.objects[0])||null;
+      var existing=firstObj?(firstObj.id||firstObj._id):'';
+      if(existing){
+        c.recordId=existing;
+        // 复用已有记录：先把云端数据拉下来合并，避免覆盖首台设备的数据
+        return syncDownload(true).then(function(){return true;});
+      }
+      // 无记录：新建
+      var createUrl='https://'+domain+'/hserve/v2.6/table/'+encodeURIComponent(c.tableName)+'/record/';
+      return fetch(createUrl,{method:'POST',headers:{'Content-Type':'application/json','X-Hydrogen-Client-ID':c.clientId,'Authorization':'Hydrogen-r1 '+tk},body:JSON.stringify({payload:JSON.stringify(dbForUpload())})}).then(function(r){return r.json().then(function(cj){return {ok:r.ok,j:cj};});}).then(function(res){
+        var rid=pickId(res.j);
+        if(!res.ok||!rid)throw new Error((res.j&&(res.j.message||res.j.error_msg))||'创建记录失败');
+        c.recordId=rid;return true;
+      });
+    });
+  }).then(function(){
+    c.autoSync=true;c.lastSyncAt=Date.now();save();
+    setSyncStatus('synced');showToast('云同步已启用，多端数据将自动互通');return true;
   }).catch(function(e){setSyncStatus('error',e.message);showToast('启用失败：'+(e.message||'网络错误'));return false;});
 }
 
