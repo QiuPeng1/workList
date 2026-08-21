@@ -913,6 +913,8 @@ var JSONBIN_BASE='https://api.jsonbin.io/v3';
 function syncConfig(){if(!DB.meta.sync)DB.meta.sync={apiKey:'',binId:'',autoSync:false,lastSyncAt:0};return DB.meta.sync;}
 function dbForUpload(){var d=JSON.parse(JSON.stringify(DB));if(d.meta)d.meta.sync=undefined;return d;} /* 上传时剔除同步凭证，避免泄露 */
 function jbHeaders(){return {'Content-Type':'application/json','X-Master-Key':syncConfig().apiKey};}
+/* 把 jsonbin 返回的真实错误透传出来，并把 fetch 网络层失败映射成中文提示，方便定位同步失败根因 */
+function jbErr(e){var m=e&&e.message?e.message:'网络错误';if((e&&e.name==='TypeError')||/failed to fetch|networkerror|load failed|typeerror/i.test(m))return '网络不可达：浏览器无法连接 api.jsonbin.io（该服务在境外，国内访问常被限制/超时）。建议改用国内可达的同步方案。';return m;}
 
 function setSyncStatus(state,msg){
   syncState=state;
@@ -938,9 +940,9 @@ function syncUpload(silent){
   setSyncStatus('syncing');
   DB.meta.lastModified=DB.meta.lastModified||Date.now();
   return fetch(JSONBIN_BASE+'/b/'+encodeURIComponent(c.binId),{method:'PUT',headers:jbHeaders(),body:JSON.stringify(dbForUpload())})
-    .then(function(res){if(!res.ok)throw new Error('HTTP '+res.status);return res.json();})
+    .then(function(res){if(!res.ok)return res.text().then(function(t){throw new Error('HTTP '+res.status+' '+(t?t.slice(0,160):''));});return res.json();})
     .then(function(){c.lastSyncAt=Date.now();save();setSyncStatus('synced');if(!silent)showToast('已上传到云端');return true;})
-    .catch(function(e){setSyncStatus('error',e.message);if(!silent)showToast('上传失败：'+(e.message||'网络错误'));return false;});
+    .catch(function(e){var msg=jbErr(e);setSyncStatus('error',msg);if(!silent)showToast('上传失败：'+msg);return false;});
 }
 
 function syncDownload(silent){
@@ -948,7 +950,7 @@ function syncDownload(silent){
   if(!c.apiKey||!c.binId){if(!silent)showToast('请先配置 API Key 与 Bin ID');return Promise.resolve(false);}
   setSyncStatus('syncing');
   return fetch(JSONBIN_BASE+'/b/'+encodeURIComponent(c.binId),{headers:jbHeaders()})
-    .then(function(res){if(!res.ok)throw new Error('HTTP '+res.status);return res.json();})
+    .then(function(res){if(!res.ok)return res.text().then(function(t){throw new Error('HTTP '+res.status+' '+(t?t.slice(0,160):''));});return res.json();})
     .then(function(data){
       var cloud=data&&data.record?data.record:null;
       if(!cloud||!cloud.tasks)throw new Error('云端数据为空或格式不符');
@@ -958,7 +960,7 @@ function syncDownload(silent){
       if(!silent)showToast('已从云端拉取');
       return true;
     })
-    .catch(function(e){setSyncStatus('error',e.message);if(!silent)showToast('拉取失败：'+(e.message||'网络错误'));return false;});
+    .catch(function(e){var msg=jbErr(e);setSyncStatus('error',msg);if(!silent)showToast('拉取失败：'+msg);return false;});
 }
 
 /* 记录级合并：云端较新或本地无改动→直接覆盖；双方都改→按 id 取较新 */
@@ -992,10 +994,10 @@ function createBin(){
   setSyncStatus('syncing');
   DB.meta.lastModified=DB.meta.lastModified||Date.now();
   return fetch(JSONBIN_BASE+'/b',{method:'POST',headers:jbHeaders(),body:JSON.stringify(dbForUpload())})
-    .then(function(res){if(!res.ok)throw new Error('HTTP '+res.status);return res.json();})
+    .then(function(res){if(!res.ok)return res.text().then(function(t){throw new Error('HTTP '+res.status+' '+(t?t.slice(0,160):''));});return res.json();})
     .then(function(data){
       var id=data&&data.metadata&&(data.metadata.id||data.metadata._id);
-      if(!id)throw new Error('未能获取 Bin ID');
+      if(!id)throw new Error('未能获取 Bin ID（响应格式异常）');
       c.binId=id;save();
       return id;
     });
@@ -1025,9 +1027,9 @@ function testSync(){
   setSyncStatus('syncing');
   var url=c.binId?JSONBIN_BASE+'/b/'+encodeURIComponent(c.binId):JSONBIN_BASE+'/b';
   fetch(url,{headers:jbHeaders()}).then(function(res){
-    if(!res.ok)throw new Error('HTTP '+res.status);
+    if(!res.ok)return res.text().then(function(t){throw new Error('HTTP '+res.status+' '+(t?t.slice(0,160):''));});
     setSyncStatus('synced');showToast('连接成功 ✅ API Key 有效'+(c.binId?'，Bin 可访问':''));
-  }).catch(function(e){setSyncStatus('error',e.message);showToast('连接失败：'+(e.message||'网络错误')+(c.binId?'（检查 Bin ID）':'（检查 API Key）'));});
+  }).catch(function(e){var msg=jbErr(e);setSyncStatus('error',msg);showToast('连接失败：'+msg+(c.binId?'（检查 Bin ID）':'（检查 API Key）'));});
 }
 function removeSync(){
   var c=syncConfig();c.apiKey='';c.binId='';c.autoSync=false;c.lastSyncAt=0;save();
