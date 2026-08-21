@@ -412,7 +412,7 @@ function save(){
   checkBackupTip();
   scheduleSyncUpload();
 }
-function load(){try{const r=localStorage.getItem(LS_KEY);if(r){DB=JSON.parse(r);if(!DB.meta)DB.meta={};if(!DB.tasks)DB.tasks=[];if(!DB.ideas)DB.ideas=[];if(!DB.projects)DB.projects=[];if(!DB.meta.sync)DB.meta.sync={masterKey:'',binId:'',autoSync:false,lastSyncAt:0};return true;}}catch(e){}return false;}
+function load(){try{const r=localStorage.getItem(LS_KEY);if(r){DB=JSON.parse(r);if(!DB.meta)DB.meta={};if(!DB.tasks)DB.tasks=[];if(!DB.ideas)DB.ideas=[];if(!DB.projects)DB.projects=[];if(!DB.meta.sync||DB.meta.sync.masterKey!==undefined)DB.meta.sync={serverDomain:'',clientId:'',username:'',password:'',tableName:'workbench',recordId:'',token:'',tokenExpire:0,autoSync:false,lastSyncAt:0};return true;}}catch(e){}return false;}
 
 /* ---------- 启动顺延：昨天的未完成 → 今天 ---------- */
 function autoPostpone(){
@@ -458,7 +458,7 @@ function init(){
   autoPostpone();
   renderSidebar();renderMobileNav();renderAll();
   var c=syncConfig();
-  if(c.autoSync&&c.masterKey&&c.binId){
+  if(c.autoSync&&c.recordId){
     setSyncStatus('syncing');
     syncDownload(true).then(function(ok){if(ok){renderAll();}});
   }else{
@@ -900,14 +900,30 @@ function pieChart(dist,total){
 }
 
 /* ============================================================
-   云同步（jsonbin.io）· 多端数据互通
-   - 用户填 Master Key → 自动创建私有 bin → 之后改动自动上传、打开页面自动拉取
-   - 合并策略：云端更新且本地无未同步改动→覆盖本地；双方都有改动→按 id 记录级合并取较新
+   云同步（知晓云 minapp）· 多端数据互通
+   - 用户填 服务器域名 + ClientID + 用户名/密码(当作同步凭证) → 自动建一条记录 → 之后改动自动上传、打开页面自动拉取
+   - 整库作为单条记录的 payload 文本字段存储，读写极省额度
+   - 合并策略见 mergeCloudData（按 id 记录级合并取较新）
    - 离线时本地照常使用，联网后自动补传
 ============================================================ */
 let syncTimer=null,syncState='idle';
-const SYNC_API='https://api.jsonbin.io/v3/b';
-function syncConfig(){if(!DB.meta.sync)DB.meta.sync={masterKey:'',binId:'',autoSync:false,lastSyncAt:0};return DB.meta.sync;}
+function syncConfig(){if(!DB.meta.sync)DB.meta.sync={serverDomain:'',clientId:'',username:'',password:'',tableName:'workbench',recordId:'',token:'',tokenExpire:0,autoSync:false,lastSyncAt:0};return DB.meta.sync;}
+function dbForUpload(){var d=JSON.parse(JSON.stringify(DB));if(d.meta)d.meta.sync=undefined;return d;} /* 上传时剔除同步凭证，避免泄露 */
+
+/* 健壮提取：兼容 Web API 多种返回结构（顶层 / data / record 包裹，id 或 _id） */
+function pickId(j){
+  if(!j)return '';
+  return j.id||j._id||(j.record&&(j.record.id||j.record._id))||(j.data&&(j.data.id||j.data._id))||'';
+}
+function pickPayload(d){
+  if(!d)return '';
+  if(d.payload!==undefined&&d.payload!==null)return d.payload;
+  if(d.record){if(d.record.payload!==undefined&&d.record.payload!==null)return d.record.payload;
+    if(d.record.record&&d.record.record.payload!==undefined&&d.record.record.payload!==null)return d.record.record.payload;}
+  if(d.data&&d.data.payload!==undefined&&d.data.payload!==null)return d.data.payload;
+  if(d.objects&&d.objects[0]&&d.objects[0].payload!==undefined&&d.objects[0].payload!==null)return d.objects[0].payload;
+  return '';
+}
 
 function setSyncStatus(state,msg){
   syncState=state;
@@ -921,39 +937,44 @@ function setSyncStatus(state,msg){
 }
 
 function scheduleSyncUpload(){
-  const c=syncConfig();
-  if(!c.autoSync||!c.masterKey||!c.binId)return;
+  var c=syncConfig();
+  if(!c.autoSync||!c.recordId)return;
   if(syncTimer)clearTimeout(syncTimer);
   syncTimer=setTimeout(function(){syncUpload(true);},2500);
 }
 
 function syncUpload(silent){
-  const c=syncConfig();
-  if(!c.masterKey||!c.binId){if(!silent)showToast('请先在数据页配置云同步');return false;}
+  var c=syncConfig();
+  if(!c.serverDomain||!c.clientId||!c.username||!c.recordId){if(!silent)showToast('请先在数据页配置云同步');return Promise.resolve(false);}
   setSyncStatus('syncing');
   DB.meta.lastModified=DB.meta.lastModified||Date.now();
-  return fetch(SYNC_API+'/'+c.binId,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':c.masterKey},body:JSON.stringify(DB)})
-    .then(function(res){if(!res.ok)throw new Error('HTTP '+res.status);return res.json();})
-    .then(function(){c.lastSyncAt=Date.now();save();setSyncStatus('synced');if(!silent)showToast('已上传到云端');return true;})
-    .catch(function(e){setSyncStatus('error',e.message);if(!silent)showToast('上传失败：'+(e.message||'网络错误'));return false;});
+  return getToken(c).then(function(tk){
+    var url='https://'+c.serverDomain.replace(/^https?:\/\//,'')+'/hserve/v2.6/table/'+encodeURIComponent(c.tableName)+'/record/'+c.recordId+'/';
+    return fetch(url,{method:'PUT',headers:{'Content-Type':'application/json','X-Hydrogen-Client-ID':c.clientId,'Authorization':'Hydrogen-r1 '+tk},body:JSON.stringify({payload:JSON.stringify(dbForUpload())})});
+  }).then(function(res){if(!res.ok)throw new Error('HTTP '+res.status);return res.json();})
+  .then(function(){c.lastSyncAt=Date.now();save();setSyncStatus('synced');if(!silent)showToast('已上传到云端');return true;})
+  .catch(function(e){setSyncStatus('error',e.message);if(!silent)showToast('上传失败：'+(e.message||'网络错误'));return false;});
 }
 
 function syncDownload(silent){
-  const c=syncConfig();
-  if(!c.masterKey||!c.binId){if(!silent)showToast('请先在数据页配置云同步');return false;}
+  var c=syncConfig();
+  if(!c.serverDomain||!c.clientId||!c.username||!c.recordId){if(!silent)showToast('请先在数据页配置云同步');return Promise.resolve(false);}
   setSyncStatus('syncing');
-  return fetch(SYNC_API+'/'+c.binId+'/latest',{headers:{'X-Master-Key':c.masterKey}})
-    .then(function(res){if(!res.ok)throw new Error('HTTP '+res.status);return res.json();})
-    .then(function(data){
-      var cloud=data.record;
-      if(!cloud||!cloud.tasks)throw new Error('云端数据为空');
-      mergeCloudData(cloud);
-      c.lastSyncAt=Date.now();save();
-      setSyncStatus('synced');
-      if(!silent)showToast('已从云端拉取');
-      return true;
-    })
-    .catch(function(e){setSyncStatus('error',e.message);if(!silent)showToast('拉取失败：'+(e.message||'网络错误'));return false;});
+  return getToken(c).then(function(tk){
+    var url='https://'+c.serverDomain.replace(/^https?:\/\//,'')+'/hserve/v2.6/table/'+encodeURIComponent(c.tableName)+'/record/'+c.recordId+'/';
+    return fetch(url,{headers:{'X-Hydrogen-Client-ID':c.clientId,'Authorization':'Hydrogen-r1 '+tk}});
+  }).then(function(res){if(!res.ok)throw new Error('HTTP '+res.status);return res.json();})
+  .then(function(data){
+    var raw=pickPayload(data);
+    if(!raw)throw new Error('云端数据为空');
+    var cloud=JSON.parse(raw);
+    mergeCloudData(cloud);
+    c.lastSyncAt=Date.now();save();
+    setSyncStatus('synced');
+    if(!silent)showToast('已从云端拉取');
+    return true;
+  })
+  .catch(function(e){setSyncStatus('error',e.message);if(!silent)showToast('拉取失败：'+(e.message||'网络错误'));return false;});
 }
 
 function mergeCloudData(cloud){
@@ -983,30 +1004,55 @@ function mergeCloudData(cloud){
   autoPostpone();
 }
 
-function enableSync(masterKey){
-  if(!masterKey||masterKey.length<20){showToast('Master Key 格式不对，请检查');return false;}
+function getToken(c){
+  if(c.token&&c.tokenExpire&&c.tokenExpire>Date.now()+60000)return Promise.resolve(c.token);
+  var base='https://'+c.serverDomain.replace(/^https?:\/\//,'')+'/hserve/v2.1';
+  var hd={'Content-Type':'application/json','X-Hydrogen-Client-ID':c.clientId};
+  function parse(r){return r.json().then(function(j){return {ok:r.ok,j:j};});}
+  function login(){return fetch(base+'/login/username/',{method:'POST',headers:hd,body:JSON.stringify({username:c.username,password:c.password})}).then(parse);}
+  function reg(){return fetch(base+'/register/username/',{method:'POST',headers:hd,body:JSON.stringify({username:c.username,password:c.password})}).then(parse);}
+  return login().then(function(res){
+    if(res.ok&&res.j&&res.j.token)return res.j.token;
+    return reg().then(function(r2){
+      if(r2.ok&&r2.j&&r2.j.token)return r2.j.token;
+      throw new Error((r2.j&&(r2.j.message||r2.j.error_msg))||'账号登录/注册失败');
+    });
+  }).then(function(tk){c.token=tk;c.tokenExpire=Date.now()+29*86400000;save();return tk;});
+}
+function enableSync(){
+  var c=syncConfig();
+  if(!c.serverDomain||!c.clientId||!c.username||!c.password){showToast('请先填写完整的同步配置');return Promise.resolve(false);}
   setSyncStatus('syncing');
   DB.meta.lastModified=DB.meta.lastModified||Date.now();
-  return fetch(SYNC_API,{method:'POST',headers:{'Content-Type':'application/json','X-Master-Key':masterKey,'X-Bin-Private':'true','X-Bin-Name':'office-workbench'},body:JSON.stringify(DB)})
-    .then(function(res){if(!res.ok)throw new Error('HTTP '+res.status);return res.json();})
-    .then(function(data){
-      var binId=data.metadata&&data.metadata.id;
-      if(!binId)throw new Error('未返回 bin id');
-      var c=syncConfig();c.masterKey=masterKey;c.binId=binId;c.autoSync=true;c.lastSyncAt=Date.now();
-      save();setSyncStatus('synced');showToast('云同步已启用，数据已上传');
-      return true;
-    })
-    .catch(function(e){setSyncStatus('error',e.message);showToast('启用失败：'+(e.message||'网络错误'));return false;});
+  return getToken(c).then(function(tk){
+    var url='https://'+c.serverDomain.replace(/^https?:\/\//,'')+'/hserve/v2.6/table/'+encodeURIComponent(c.tableName)+'/record/';
+    return fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Hydrogen-Client-ID':c.clientId,'Authorization':'Hydrogen-r1 '+tk},body:JSON.stringify({payload:JSON.stringify(dbForUpload())})}).then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});});
+  }).then(function(res){
+    var rid=pickId(res.j);
+    if(!res.ok||!rid)throw new Error((res.j&&(res.j.message||res.j.error_msg))||'创建记录失败');
+    c.recordId=rid;c.autoSync=true;c.lastSyncAt=Date.now();save();
+    setSyncStatus('synced');showToast('云同步已启用，数据已上传');return true;
+  }).catch(function(e){setSyncStatus('error',e.message);showToast('启用失败：'+(e.message||'网络错误'));return false;});
 }
 
 function disableSync(){
   var c=syncConfig();c.autoSync=false;save();setSyncStatus('idle');
   showToast('已关闭自动同步（云端数据保留，可重新启用）');
 }
-
+function testSync(){
+  var c=syncConfig();
+  if(!c.serverDomain||!c.clientId||!c.username||!c.password){showToast('请先填写完整的同步配置');return;}
+  setSyncStatus('syncing');
+  getToken(c).then(function(tk){
+    var url='https://'+c.serverDomain.replace(/^https?:\/\//,'')+'/hserve/v2.6/table/'+encodeURIComponent(c.tableName)+'/record/?limit=1';
+    return fetch(url,{headers:{'X-Hydrogen-Client-ID':c.clientId,'Authorization':'Hydrogen-r1 '+tk}});
+  }).then(function(res){if(!res.ok)throw new Error('HTTP '+res.status);return res.json();})
+  .then(function(){setSyncStatus('synced');showToast('连接成功 ✅ 服务器/ClientID/表名均正常');})
+  .catch(function(e){setSyncStatus('error',e.message);showToast('连接失败：'+(e.message||'网络错误')+'（检查服务器域名、ClientID、表名与权限）');});
+}
 function removeSync(){
-  var c=syncConfig();c.masterKey='';c.binId='';c.autoSync=false;c.lastSyncAt=0;save();
-  setSyncStatus('idle');showToast('已断开云同步（云端数据需登录 jsonbin.io 删除）');
+  var c=syncConfig();c.serverDomain='';c.clientId='';c.username='';c.password='';c.tableName='workbench';c.recordId='';c.token='';c.tokenExpire=0;c.autoSync=false;c.lastSyncAt=0;save();
+  setSyncStatus('idle');showToast('已断开云同步（云端记录需登录知晓云控制台删除）');
 }
 
 /* ============================================================
@@ -1059,34 +1105,45 @@ function clearAll(){
 }
 function showDataSheet(){
   var c=syncConfig();
-  var enabled=c.masterKey&&c.binId;
+  var enabled=c.recordId;
   var syncCard;
   if(!enabled){
     syncCard='<div class="card card-pad sync-card" style="margin-bottom:12px">'+
-      '<h3><svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M6 16a4 4 0 010-8 5 5 0 019.6-1.5A4.5 4.5 0 1117 16H6z" stroke="#0d9488" stroke-width="1.8" stroke-linejoin="round" fill="none"/></svg>云同步 · 多端数据互通</h3>'+
-      '<div class="sync-info">启用后，手机和电脑的数据会自动同步到云端，所有设备读写同一份数据。离线时本地照常使用，联网后自动补传。</div>'+
-      '<div class="sync-step"><span class="num">1</span><b>注册 jsonbin.io</b>（免费）：打开 <b>jsonbin.io</b> → 用邮箱注册登录</div>'+
-      '<div class="sync-step"><span class="num">2</span><b>复制 Master Key</b>：登录后点右上角头像 → 「API Keys」→ 复制 <b>X-Master-Key</b> 的值</div>'+
-      '<div class="sync-step"><span class="num">3</span><b>粘贴到下方</b>并点「启用云同步」，系统会自动创建私有存储桶并上传当前数据</div>'+
-      '<input class="input" id="syncKey" type="password" placeholder="粘贴你的 X-Master-Key（$2a$10$ 开头，约60位）" style="margin-top:10px">'+
-      '<button class="btn btn-primary" id="syncEnable" style="width:100%;margin-top:9px"><svg width="17" height="17" viewBox="0 0 24 24" fill="none"><path d="M6 16a4 4 0 010-8 5 5 0 019.6-1.5A4.5 4.5 0 1117 16H6z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" fill="none"/></svg>启用云同步</button>'+
-      '<div class="sync-info" style="margin-top:10px;color:var(--ink3)">⚠️ Master Key 存在本机浏览器，仅用于同步请求。因是个人工作台、链接仅你持有，风险可控。免费额度 1 万次/月，个人使用绰绰有余。</div>'+
+      '<h3><svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M6 16a4 4 0 010-8 5 5 0 019.6-1.5A4.5 4.5 0 1117 16H6z" stroke="#0d9488" stroke-width="1.8" stroke-linejoin="round" fill="none"/></svg>云同步 · 多端数据互通（知晓云）</h3>'+
+      '<div class="sync-info">启用后手机和电脑自动同步同一份数据，离线照常使用，联网后自动补传。需在知晓云建一个数据表（步骤见下）。</div>'+
+      '<div class="sync-step"><span class="num">1</span><b>建数据表</b>：知晓云控制台 → 数据管理 → 新建表（名称如 <b>workbench</b>），加一个<b>文本</b>字段 <b>payload</b>，权限设为「所有人可读写」</div>'+
+      '<div class="sync-step"><span class="num">2</span><b>拿两个值</b>：控制台「设置」→ 服务器域名（如 <b>xxxx.myminapp.com</b>）、开发者 ID 里的 <b>ClientID</b>；并在「登录方法」开通<b>用户名+密码登录</b></div>'+
+      '<div class="sync-step"><span class="num">3</span><b>加安全域名（必做）</b>：控制台「设置」→「域名设置」→「安全域名」里，<b>加上你部署后的页面地址</b>（GitHub Pages 形如 <b>https://你的用户名.github.io</b>，本地调试用 <b>http://localhost:8765</b>）。不加会被浏览器跨域拦截，同步必失败。</div>'+
+      '<div class="sync-step"><span class="num">4</span><b>填下方并启用</b>：用户名/密码是你自设的「同步凭证」，手机电脑填一样的即可</div>'+
+      '<div class="form-row" style="flex-direction:column;gap:8px;margin-top:10px">'+
+        '<input class="input" id="syncDomain" placeholder="服务器域名，如 abcd1234.myminapp.com">'+
+        '<input class="input" id="syncClient" placeholder="ClientID（开发者 ID）">'+
+        '<input class="input" id="syncUser" placeholder="用户名（自设，多端一致）">'+
+        '<input class="input" id="syncPass" type="password" placeholder="密码（自设，多端一致）">'+
+        '<input class="input" id="syncTable" placeholder="数据表名，默认 workbench" value="workbench">'+
+      '</div>'+
+      '<div class="form-row" style="gap:9px;margin-top:9px">'+
+        '<button class="btn btn-primary" id="syncEnable" style="flex:1;min-width:0">启用云同步</button>'+
+        '<button class="btn btn-ghost" id="syncTest" style="flex:1;min-width:0">测试连接</button>'+
+      '</div>'+
+      '<div class="sync-info" style="margin-top:10px;color:var(--ink3)">⚠️ 凭证存本机浏览器，仅用于同步请求，链接仅你持有风险可控。免费额度 1 万次/天，个人绰绰有余。</div>'+
     '</div>';
   }else{
     var autoTxt=c.autoSync?'已开启':'已关闭';
     syncCard='<div class="card card-pad sync-card" style="margin-bottom:12px">'+
       '<h3><svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M6 16a4 4 0 010-8 5 5 0 019.6-1.5A4.5 4.5 0 1117 16H6z" stroke="#0d9488" stroke-width="1.8" stroke-linejoin="round" fill="none"/></svg>云同步 · 多端数据互通 <span class="sync-status '+syncState+'">'+syncStateText()+'</span></h3>'+
-      '<div class="sync-info">自动同步：<b>'+autoTxt+'</b>　|　存储桶 ID：<b style="font-size:11px;word-break:break-all">'+esc(c.binId)+'</b></div>'+
+      '<div class="sync-info">自动同步：<b>'+autoTxt+'</b>　|　记录 ID：<b style="font-size:11px;word-break:break-all">'+esc(c.recordId)+'</b></div>'+
       '<div class="sync-info" style="color:var(--ink3)">改动后自动上传 · 打开页面自动拉取 · 离线照常使用</div>'+
       '<div class="form-row" style="gap:9px;margin-top:8px">'+
         '<button class="btn btn-primary" id="syncUp" style="flex:1;min-width:0"><svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 17v2a2 2 0 002 2h10a2 2 0 002-2v-2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>上传云端</button>'+
         '<button class="btn btn-ghost" id="syncDown" style="flex:1;min-width:0"><svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 15V3m0 0L8 7m4-4l4 4M5 17v2a2 2 0 002 2h10a2 2 0 002-2v-2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>从云端拉取</button>'+
       '</div>'+
       '<div class="form-row" style="gap:9px;margin-top:9px">'+
+        '<button class="btn btn-ghost" id="syncTest" style="flex:1;min-width:0">测试连接</button>'+
         '<button class="btn btn-ghost" id="syncToggle" style="flex:1;min-width:0">'+(c.autoSync?'关闭自动同步':'开启自动同步')+'</button>'+
-        '<button class="btn btn-danger" id="syncRemove" style="flex:1;min-width:0">断开云同步</button>'+
+        '<button class="btn btn-danger" id="syncRemove" style="flex:1;min-width:0">断开</button>'+
       '</div>'+
-      '<div class="sync-info" style="margin-top:10px;color:var(--ink3)">断开后云端数据仍保留在 jsonbin.io，可重新启用连回；如需彻底删除云端数据，登录 jsonbin.io 删除该 bin。</div>'+
+      '<div class="sync-info" style="margin-top:10px;color:var(--ink3)">断开后云端记录仍保留在知晓云，可重新启用连回；彻底删除请登录知晓云控制台删除该记录。</div>'+
     '</div>';
   }
   var html='<h2 class="sec"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 17v2a2 2 0 002 2h10a2 2 0 002-2v-2" stroke="#0d9488" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>数据管理<span class="desc">云同步 · 备份 · 导入 · 清空</span></h2>'+
@@ -1104,11 +1161,31 @@ function showDataSheet(){
   $('#mImport').onclick=function(){$('#importInput').click();};
   $('#mClearDemo').onclick=clearDemo;
   $('#mClearAll').onclick=clearAll;
-  var se=$('#syncEnable');if(se)se.onclick=function(){var k=$('#syncKey').value.trim();enableSync(k).then(function(ok){if(ok)showDataSheet();});};
+  var se=$('#syncEnable');if(se)se.onclick=function(){
+    var c=syncConfig();
+    c.serverDomain=$('#syncDomain').value.trim();
+    c.clientId=$('#syncClient').value.trim();
+    c.username=$('#syncUser').value.trim();
+    c.password=$('#syncPass').value;
+    c.tableName=$('#syncTable').value.trim()||'workbench';
+    if(!c.serverDomain||!c.clientId||!c.username||!c.password){showToast('请填完整四项再启用');return;}
+    save();
+    enableSync().then(function(ok){if(ok)showDataSheet();});
+  };
+  var stest=$('#syncTest');if(stest)stest.onclick=function(){
+    var c=syncConfig();
+    c.serverDomain=$('#syncDomain').value.trim();
+    c.clientId=$('#syncClient').value.trim();
+    c.username=$('#syncUser').value.trim();
+    c.password=$('#syncPass').value;
+    c.tableName=$('#syncTable').value.trim()||'workbench';
+    if(!c.serverDomain||!c.clientId||!c.username||!c.password){showToast('请填完整四项再测试');return;}
+    save();testSync();
+  };
   var su=$('#syncUp');if(su)su.onclick=function(){syncUpload(false);};
   var sd=$('#syncDown');if(sd)sd.onclick=function(){syncDownload(false).then(function(ok){if(ok)renderAll();});};
   var st=$('#syncToggle');if(st)st.onclick=function(){if(c.autoSync){disableSync();}else{c.autoSync=true;save();setSyncStatus('synced');showToast('已开启自动同步');}showDataSheet();};
-  var sr=$('#syncRemove');if(sr)sr.onclick=function(){confirmBox('断开云同步？','本机将清除云端配置，不再自动同步。云端数据仍保留在 jsonbin.io，可重新启用连回。',removeSync);};
+  var sr=$('#syncRemove');if(sr)sr.onclick=function(){confirmBox('断开云同步？','本机将清除云端配置与凭证，不再自动同步。云端记录仍保留在知晓云，可重新启用连回。',removeSync);};
 }
 function syncStateText(){return {idle:'未同步',syncing:'同步中',synced:'已同步',offline:'离线',error:'同步失败'}[syncState]||syncState;}
 
