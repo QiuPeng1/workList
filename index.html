@@ -271,6 +271,13 @@ textarea.input{resize:vertical;min-height:72px;line-height:1.55;padding:11px 12p
 .modal p{margin:0 0 18px;font-size:14px;color:var(--ink2);line-height:1.6}
 .modal .acts{display:flex;gap:9px;justify-content:flex-end}
 .modal .acts .btn{min-height:42px}
+.task-item{cursor:pointer}
+.task-group .gt{cursor:pointer;user-select:none}
+.task-group .gt:hover{color:#0d9488}
+.gt-toggle{display:inline-block;margin-left:4px;color:var(--ink3);font-size:11px;transition:transform .15s}
+.task-group.collapsed .gt-toggle{transform:rotate(-90deg)}
+.modal .acts .btn-danger{margin-right:auto}
+.edit-field{display:flex;flex-direction:column;gap:9px;margin-bottom:10px}
 
 /* ===== 云同步 ===== */
 .sync-card h3{margin:0 0 4px;font-size:15px;display:flex;align-items:center;gap:8px}
@@ -373,6 +380,27 @@ textarea.input{resize:vertical;min-height:72px;line-height:1.55;padding:11px 12p
     <div class="acts">
       <button class="btn btn-ghost" id="modalCancel">取消</button>
       <button class="btn btn-primary" id="modalOk">确定</button>
+    </div>
+  </div>
+</div>
+<div class="modal-mask" id="editMask">
+  <div class="modal" style="max-width:430px">
+    <h3 id="editTitle2">编辑待办</h3>
+    <div class="edit-field">
+      <input class="input" id="editTitle" placeholder="任务内容">
+      <div class="form-row" style="gap:8px">
+        <select class="select" id="editPri" style="flex:1;min-width:0">
+          <option value="urgent">紧急</option><option value="high">高</option><option value="mid">中</option><option value="low">低</option>
+        </select>
+        <input class="input" id="editDue" type="date" style="flex:1;min-width:0">
+      </div>
+      <select class="select" id="editProj"><option value="">不关联项目</option></select>
+    </div>
+    <div id="editMeta" style="font-size:12px;color:var(--ink3);line-height:1.7;margin-bottom:14px"></div>
+    <div class="acts">
+      <button class="btn btn-danger" id="editDel">删除</button>
+      <button class="btn btn-ghost" id="editToggle">标记为完成</button>
+      <button class="btn btn-primary" id="editSave">保存</button>
     </div>
   </div>
 </div>
@@ -655,9 +683,9 @@ function renderTaskList(){
   groups.forEach(g=>{
     if(!g.items.length)return;
     const collapsed=g.key==='done';
-    h+=`<div class="task-group ${g.cls}">
-      <div class="gt"><span class="group-stripe"></span>${g.label}<span class="cnt">${g.items.length}</span></div>
-      <div ${collapsed?'style="display:none"':''}>${g.items.map(x=>taskCard(x)).join('')}</div>
+    h+=`<div class="task-group ${g.cls} ${collapsed?'collapsed':''}">
+      <div class="gt" data-group="${g.key}"><span class="group-stripe"></span>${g.label}<span class="cnt">${g.items.length}</span><span class="gt-toggle">▾</span></div>
+      <div class="group-body" data-body="${g.key}" ${collapsed?'style="display:none"':''}>${g.items.map(x=>taskCard(x)).join('')}</div>
     </div>`;
   });
   if(!h)h=`<div class="empty-state"><svg width="52" height="52" viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="17" rx="3" stroke="#cbd5e1" stroke-width="1.6"/><path d="M8 11h8M8 15h5" stroke="#cbd5e1" stroke-width="1.6" stroke-linecap="round"/></svg><div>还没有任务，添加第一条吧</div></div>`;
@@ -689,6 +717,16 @@ function bindTaskEvents(){
   document.querySelectorAll('[data-check]').forEach(b=>b.onclick=()=>toggleTask(b.dataset.check));
   document.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>{const x=DB.tasks.find(t=>t.id===b.dataset.del);if(x){DB.tasks=DB.tasks.filter(t=>t!==x);save();renderAll();}});
   document.querySelectorAll('#taskList [data-post]').forEach(b=>b.onclick=()=>postponeTask(b.dataset.post));
+  document.querySelectorAll('#taskList .gt').forEach(g=>g.onclick=()=>{
+    const body=document.querySelector('#taskList [data-body="'+g.dataset.group+'"]');
+    const grp=g.closest('.task-group');
+    if(!body)return;
+    if(body.style.display==='none'){body.style.display='block';grp.classList.remove('collapsed');}
+    else{body.style.display='none';grp.classList.add('collapsed');}
+  });
+  document.querySelectorAll('#taskList .task-item').forEach(el=>{
+    el.onclick=function(e){ if(e.target.closest('button'))return; openTaskEditor(el.dataset.id); };
+  });
 }
 function toggleTask(id){
   const x=DB.tasks.find(t=>t.id===id);if(!x)return;
@@ -699,6 +737,47 @@ function postponeTask(id){
   const x=DB.tasks.find(t=>t.id===id);if(!x)return;
   x.dueDate=tomorrowStr();x.postponedCount=(x.postponedCount||0)+1;
   save();renderAll();showToast('已顺延到明天');
+}
+
+/* ---------- 待办：编辑 / 查看 / 恢复 ---------- */
+function fmtDateTime(ts){if(!ts)return '—';const d=new Date(ts);const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());}
+let editId=null;
+function openTaskEditor(id){
+  const x=DB.tasks.find(t=>t.id===id);if(!x)return;
+  editId=id;
+  $('#editTitle').value=x.title||'';
+  $('#editPri').value=x.priority||'high';
+  $('#editDue').value=x.dueDate||'';
+  const projSel=$('#editProj');
+  projSel.innerHTML='<option value="">不关联项目</option>'+DB.projects.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('');
+  projSel.value=x.projectId||'';
+  const meta=[];
+  meta.push('创建：'+fmtDateTime(x.createdAt||0));
+  if(x.completedAt)meta.push('完成：'+fmtDateTime(x.completedAt));
+  if(x.postponedCount>0)meta.push('顺延 '+x.postponedCount+' 次');
+  $('#editMeta').innerHTML=meta.join('　·　');
+  const tg=$('#editToggle');
+  tg.textContent=x.done?'恢复为未完成':'标记为完成';
+  $('#editTitle2').textContent=x.done?'查看待办':'编辑待办';
+  $('#editMask').classList.add('show');
+  setTimeout(()=>{$('#editTitle').focus();$('#editTitle').select();},60);
+}
+function saveTaskEdit(){
+  const x=DB.tasks.find(t=>t.id===editId);if(!x)return;
+  const title=$('#editTitle').value.trim();
+  if(!title){showToast('任务内容不能为空');return;}
+  x.title=title;x.priority=$('#editPri').value;x.dueDate=$('#editDue').value||null;x.projectId=$('#editProj').value||null;x.updatedAt=Date.now();
+  save();closeEdit();renderAll();showToast('已保存修改');
+}
+function toggleFromEditor(){
+  const x=DB.tasks.find(t=>t.id===editId);if(!x)return;
+  x.done=!x.done;x.completedAt=x.done?Date.now():null;
+  save();closeEdit();renderAll();showToast(x.done?'已标记为完成':'已恢复为未完成');
+}
+function closeEdit(){$('#editMask').classList.remove('show');}
+function delFromEditor(){
+  const x=DB.tasks.find(t=>t.id===editId);if(!x)return;
+  confirmBox('删除该待办？','删除后无法恢复。',()=>{DB.tasks=DB.tasks.filter(t=>t!==x);save();closeEdit();renderAll();showToast('已删除');});
 }
 
 /* ============================================================
@@ -1193,6 +1272,10 @@ function renderAll(){renderHead();renderAlert();renderMain();renderSidebar();ren
 /* ---------- 事件绑定 ---------- */
 $('#modalCancel').onclick=closeModal;
 $('#modalMask').addEventListener('click',e=>{if(e.target.id==='modalMask')closeModal();});
+$('#editSave').onclick=saveTaskEdit;
+$('#editToggle').onclick=toggleFromEditor;
+$('#editDel').onclick=delFromEditor;
+$('#editMask').addEventListener('click',e=>{if(e.target.id==='editMask')closeEdit();});
 $('#importInput').addEventListener('change',e=>{if(e.target.files[0])importData(e.target.files[0]);e.target.value='';});
 
 /* ---------- 全局错误兜底（兼容性问题时显示错误，避免空白） ---------- */
