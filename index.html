@@ -435,7 +435,7 @@ const PROJ_COLORS=['#0d9488','#0891b2','#7c3aed','#db2777','#ea8a17','#16a34a','
 
 /* ---------- 持久化 ---------- */
 function save(){
-  DB.meta.lastModified=DB.meta.lastModified||Date.now();
+  DB.meta.lastModified=Date.now();
   localStorage.setItem(LS_KEY,JSON.stringify(DB));
   checkBackupTip();
   scheduleSyncUpload();
@@ -488,7 +488,10 @@ function init(){
   var c=syncConfig();
   if(c.autoSync&&c.token&&c.path){
     setSyncStatus('syncing');
-    syncDownload(true).then(function(ok){if(ok){renderAll();}});
+    syncDownload(true).then(function(ok){
+      /* 拉取后若本地有更新的未同步改动，立即回传云端，避免刷新丢数据 */
+      if(ok&&DB.meta.lastModified&&c.lastSyncAt&&DB.meta.lastModified>c.lastSyncAt){return syncUpload(true);}
+    }).then(function(){renderAll();});
   }else{
     setSyncStatus('idle');
   }
@@ -1020,7 +1023,7 @@ function scheduleSyncUpload(){
 function syncUpload(silent){
   var c=syncConfig();
   if(!c.token||!c.path){if(!silent)showToast('请先配置 GitHub 同步');return Promise.resolve(false);}
-  if(c.lastSyncAt&&DB.meta.lastModified&&DB.meta.lastModified<=c.lastSyncAt){setSyncStatus('synced');return Promise.resolve(true);} /* 无变化跳过，避免频繁提交 */
+  if(c.lastSyncAt&&DB.meta.lastModified&&DB.meta.lastModified<=c.lastSyncAt){setSyncStatus('synced');if(!silent)showToast('无变更，云端已是最新');return Promise.resolve(true);} /* 无变化跳过，避免频繁提交 */
   setSyncStatus('syncing');
   DB.meta.lastModified=DB.meta.lastModified||Date.now();
   return fetch(ghUrl(c),{headers:ghHeaders()}).then(function(res){
@@ -1033,7 +1036,7 @@ function syncUpload(silent){
     c.sha=sha||'';
     return fetch(ghUrl(c),{method:'PUT',headers:ghHeaders(),body:JSON.stringify(body)});
   }).then(function(res){if(!res.ok)return res.text().then(function(t){throw new Error('HTTP '+res.status+' '+(t?t.slice(0,160):''));});return res.json();})
-  .then(function(j){c.sha=j.content&&j.content.sha?j.content.sha:'';c.lastSyncAt=Date.now();save();setSyncStatus('synced');if(!silent)showToast('已上传到云端');return true;})
+  .then(function(j){c.sha=j.content&&j.content.sha?j.content.sha:'';save();c.lastSyncAt=Date.now();setSyncStatus('synced');if(!silent)showToast('已上传到云端');return true;})
   .catch(function(e){var msg=ghErr(e);setSyncStatus('error',msg);if(!silent)showToast('上传失败：'+msg);return false;});
 }
 
@@ -1050,38 +1053,26 @@ function syncDownload(silent){
     var cloud=JSON.parse(b64decode(data.content));
     if(!cloud.tasks&&!cloud.ideas&&!cloud.projects)throw new Error('云端数据格式不符');
     c.sha=data.sha||'';
-    mergeCloudData(cloud);
-    c.lastSyncAt=Date.now();save();
+    var usedCloud=mergeCloudData(cloud);
+    if(usedCloud){c.lastSyncAt=Date.now();save();}
     setSyncStatus('synced');
-    if(!silent)showToast('已从云端拉取');
+    if(!silent)showToast('已从云端'+(usedCloud?'拉取':'合并（保留本地）'));
     return true;
   }).catch(function(e){var msg=ghErr(e);setSyncStatus('error',msg);if(!silent)showToast('拉取失败：'+msg);return false;});
 }
 
-/* 记录级合并：云端较新或本地无改动→直接覆盖；双方都改→按 id 取较新 */
+/* 整库「最后写入者胜」：云端 lastModified 更大→采用云端；否则保留本地（由 autosync 负责回传云端） */
 function mergeCloudData(cloud){
   var localMod=DB.meta.lastModified||0;
   var cloudMod=(cloud.meta&&cloud.meta.lastModified)||0;
-  var localClean=DB.meta.lastSyncAt&&localMod<=DB.meta.lastSyncAt;
-  if(cloudMod>=localMod||localClean){
+  if(cloudMod>localMod){
     DB.tasks=cloud.tasks||[];DB.ideas=cloud.ideas||[];DB.projects=cloud.projects||[];
     if(cloud.meta)DB.meta.backupPromptedCount=cloud.meta.backupPromptedCount||0;
-    DB.meta.lastModified=cloudMod;DB.meta.lastSyncAt=Date.now();
+    DB.meta.lastModified=cloudMod;
     autoPostpone();
-    return;
+    return true; /* 采用了云端（云端更新） */
   }
-  var recTs=function(r){return r.updatedAt||r.createdAt||0;};
-  function mergeArr(la,ca){
-    var m={};
-    la.forEach(function(r){m[r.id]=r;});
-    ca.forEach(function(r){if(!m[r.id]||recTs(r)>recTs(m[r.id]))m[r.id]=r;});
-    return Object.keys(m).map(function(k){return m[k];});
-  }
-  DB.tasks=mergeArr(DB.tasks,cloud.tasks||[]);
-  DB.ideas=mergeArr(DB.ideas,cloud.ideas||[]);
-  DB.projects=mergeArr(DB.projects,cloud.projects||[]);
-  DB.meta.lastModified=Date.now();DB.meta.lastSyncAt=Date.now();
-  autoPostpone();
+  return false; /* 保留本地（本地较新或相同），稍后由上传同步 */
 }
 
 /* 确保云端数据文件存在：存在则取 sha；不存在则创建 */
